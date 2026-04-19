@@ -1,20 +1,11 @@
-import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Annotated
 
 from agent_framework import tool
 from pydantic import Field
 
-DEFAULT_NOTES_DIR = Path(__file__).resolve().parents[1] / "data" / "notes"
-
-
-def _get_notes_dir() -> Path:
-    raw_dir = os.getenv("BUDDY_NOTES_DIR", "").strip()
-    notes_dir = Path(raw_dir).expanduser() if raw_dir else DEFAULT_NOTES_DIR
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    return notes_dir
+from db import get_connection
 
 
 def _slugify(value: str) -> str:
@@ -23,17 +14,17 @@ def _slugify(value: str) -> str:
     return slug or "note"
 
 
-def _create_unique_note_path(title: str) -> Path:
-    notes_dir = _get_notes_dir()
+def _unique_id(title: str) -> str:
     base = _slugify(title)
-    candidate = notes_dir / f"{base}.md"
-    index = 2
-
-    while candidate.exists():
-        candidate = notes_dir / f"{base}-{index}.md"
-        index += 1
-
-    return candidate
+    with get_connection() as conn:
+        if conn.execute("SELECT 1 FROM notes WHERE id = ?", (base,)).fetchone() is None:
+            return base
+        index = 2
+        while True:
+            candidate = f"{base}-{index}"
+            if conn.execute("SELECT 1 FROM notes WHERE id = ?", (candidate,)).fetchone() is None:
+                return candidate
+            index += 1
 
 
 @tool(approval_mode="never_require")
@@ -41,7 +32,7 @@ def create_note(
     title: Annotated[str, Field(description="Short title for the note.")],
     content: Annotated[str, Field(description="Main note content.")],
 ) -> str:
-    """Store a note locally so it can be searched and read later."""
+    """Store a note in the local SQLite database so it can be searched and read later."""
     title = title.strip()
     content = content.strip()
 
@@ -51,22 +42,17 @@ def create_note(
     if not content:
         return "Note content cannot be empty."
 
+    note_id = _unique_id(title)
     now = datetime.now(timezone.utc).isoformat()
-    path = _create_unique_note_path(title)
-    note_id = path.stem
 
-    body = "\n".join(
-        [
-            f"Title: {title}",
-            f"Created: {now}",
-            "",
-            content,
-            "",
-        ]
-    )
-    path.write_text(body, encoding="utf-8")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO notes (id, title, content, created_at) VALUES (?, ?, ?, ?)",
+            (note_id, title, content, now),
+        )
+        conn.commit()
 
-    return f"Saved note '{note_id}' at {path}."
+    return f"Saved note '{note_id}'."
 
 
 @tool(approval_mode="never_require")
@@ -83,26 +69,26 @@ def search_notes(
         return "Search query cannot be empty."
 
     max_results = max(1, min(max_results, 50))
-    keyword = query.lower()
-    matches: list[tuple[str, str]] = []
+    keyword = f"%{query.lower()}%"
 
-    for path in sorted(_get_notes_dir().glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        if keyword not in text.lower():
-            continue
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, content FROM notes
+            WHERE lower(title) LIKE ? OR lower(content) LIKE ?
+            ORDER BY created_at
+            LIMIT ?
+            """,
+            (keyword, keyword, max_results),
+        ).fetchall()
 
-        preview = text.splitlines()[-1].strip() if text.splitlines() else ""
-        if not preview:
-            preview = "(empty note body)"
-
-        matches.append((path.stem, preview))
-
-    if not matches:
+    if not rows:
         return f"No notes matched '{query}'."
 
-    lines = [f"Found {min(len(matches), max_results)} note(s):"]
-    for note_id, preview in matches[:max_results]:
-        lines.append(f"- {note_id}: {preview[:120]}")
+    lines = [f"Found {len(rows)} note(s):"]
+    for row in rows:
+        preview = row["content"][:120].replace("\n", " ")
+        lines.append(f"- {row['id']}: {preview}")
 
     return "\n".join(lines)
 
@@ -116,23 +102,19 @@ def list_notes(
 ) -> str:
     """List all locally stored notes with their id, title, and creation date."""
     max_results = max(1, min(max_results, 50))
-    paths = sorted(_get_notes_dir().glob("*.md"))
 
-    if not paths:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, title, created_at FROM notes ORDER BY created_at LIMIT ?",
+            (max_results,),
+        ).fetchall()
+
+    if not rows:
         return "No notes found."
 
-    lines = [f"Found {min(len(paths), max_results)} note(s):"]
-    for path in paths[:max_results]:
-        title = path.stem
-        created = ""
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("Title: "):
-                title = line[len("Title: "):]
-            elif line.startswith("Created: "):
-                created = line[len("Created: "):]
-            if title and created:
-                break
-        lines.append(f"- {path.stem}: {title} ({created})" if created else f"- {path.stem}: {title}")
+    lines = [f"Found {len(rows)} note(s):"]
+    for row in rows:
+        lines.append(f"- {row['id']}: {row['title']} ({row['created_at']})")
 
     return "\n".join(lines)
 
@@ -141,32 +123,38 @@ def list_notes(
 def read_note(
     note_id: Annotated[
         str,
-        Field(description="Note id (filename without extension), typically from search_notes results."),
+        Field(description="Note id, typically from search_notes or list_notes results."),
     ]
 ) -> str:
-    """Read a previously stored local note by id."""
-    safe_note_id = _slugify(note_id)
-    path = _get_notes_dir() / f"{safe_note_id}.md"
+    """Read a previously stored note by id."""
+    safe_id = _slugify(note_id)
 
-    if not path.exists():
-        return f"No note found with id '{safe_note_id}'."
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT title, content, created_at FROM notes WHERE id = ?", (safe_id,)
+        ).fetchone()
 
-    return path.read_text(encoding="utf-8").strip()
+    if row is None:
+        return f"No note found with id '{safe_id}'."
+
+    return f"Title: {row['title']}\nCreated: {row['created_at']}\n\n{row['content']}"
 
 
 @tool(approval_mode="never_require")
 def delete_note(
     note_id: Annotated[
         str,
-        Field(description="Note id (filename without extension), typically from list_notes or search_notes results."),
+        Field(description="Note id, typically from list_notes or search_notes results."),
     ]
 ) -> str:
     """Delete a locally stored note by id."""
-    safe_note_id = _slugify(note_id)
-    path = _get_notes_dir() / f"{safe_note_id}.md"
+    safe_id = _slugify(note_id)
 
-    if not path.exists():
-        return f"No note found with id '{safe_note_id}'."
+    with get_connection() as conn:
+        result = conn.execute("DELETE FROM notes WHERE id = ?", (safe_id,))
+        conn.commit()
 
-    path.unlink()
-    return f"Deleted note '{safe_note_id}'."
+    if result.rowcount == 0:
+        return f"No note found with id '{safe_id}'."
+
+    return f"Deleted note '{safe_id}'."
