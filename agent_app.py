@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import os
 import shlex
+import signal
 import sys
 import time
 from pathlib import Path
@@ -11,12 +12,14 @@ from urllib.parse import urljoin
 import httpx
 from rich.console import Console
 from rich.markdown import Markdown
-from agent_framework import Agent, AgentSession, InMemoryHistoryProvider
+from agent_framework import Agent, AgentSession, InMemoryHistoryProvider, MCPStdioTool
 from agent_framework.openai import OpenAIChatCompletionClient
 from dotenv import load_dotenv
 
-from tools import all_tools, all_tool_functions
+from tools import all_tool_functions
 from training.chatml_logger import save_interaction
+
+MCP_SERVER_PATH = Path(__file__).parent / "mcp_server.py"
 
 DEFAULT_PROMPT_PATH = Path("prompts/system_prompt.md")
 
@@ -120,12 +123,21 @@ def load_system_prompt() -> str:
         return fallback_prompt
 
 
-def create_agent() -> tuple[Agent, InMemoryHistoryProvider]:
-    from db import get_db_path
-    tools = all_tools()
+def create_mcp_tool() -> MCPStdioTool:
+    """Create the MCPStdioTool that launches the buddy-tools MCP server."""
+    return MCPStdioTool(
+        name="buddy-tools",
+        command=sys.executable,
+        args=[str(MCP_SERVER_PATH)],
+        approval_mode="never_require",
+    )
+
+
+def create_agent(mcp_tool: MCPStdioTool) -> tuple[Agent, InMemoryHistoryProvider]:
+    from db import get_redis_url
     history = InMemoryHistoryProvider()
-    vlog(f"DB path  : {get_db_path()}")
-    vlog(f"Tools ({len(tools)}): {', '.join(t.name for t in tools)}")
+    vlog(f"Redis URL: {get_redis_url()}")
+    vlog("Tools: buddy-tools MCP server")
     agent = Agent(
         client=OpenAIChatCompletionClient(
             model=os.environ["OPENAI_MODEL"],
@@ -133,8 +145,8 @@ def create_agent() -> tuple[Agent, InMemoryHistoryProvider]:
         ),
         name="BuddyAgent",
         instructions=load_system_prompt(),
-        tools=tools,
-        context_providers=[history],
+        tools=mcp_tool,
+        context_providers=[history]
     )
     return agent, history
 
@@ -327,8 +339,22 @@ async def run_interactive_session(agent: Agent) -> None:
         if handle_slash_command(user_prompt, console):
             continue
 
-        print("Buddy> Processing...", flush=True)
-        answer = await run_agent(agent, user_prompt, session=session)
+        print("Buddy> Processing… (Ctrl+C to cancel)", flush=True)
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(run_agent(agent, user_prompt, session=session))
+
+        def _on_sigint() -> None:
+            task.cancel()
+
+        loop.add_signal_handler(signal.SIGINT, _on_sigint)
+        try:
+            answer = await task
+        except asyncio.CancelledError:
+            console.print("\n[yellow]⚠  Request cancelled.[/yellow]")
+            continue
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
+
         console.print("Buddy> ", end="")
         console.print(Markdown(answer))
 
@@ -369,16 +395,18 @@ async def main() -> None:
     if not check_api_reachable():
         sys.exit(1)
 
-    agent, _ = create_agent()
+    mcp_tool = create_mcp_tool()
+    async with mcp_tool:
+        agent, _ = create_agent(mcp_tool)
 
-    if args.interactive:
-        await run_interactive_session(agent)
-        return
+        if args.interactive:
+            await run_interactive_session(agent)
+            return
 
-    print("Buddy> Processing...", flush=True)
-    answer = await run_agent(agent, args.prompt)
-    console = Console()
-    console.print(Markdown(answer))
+        print("Buddy> Processing...", flush=True)
+        answer = await run_agent(agent, args.prompt)
+        console = Console()
+        console.print(Markdown(answer))
 
 
 if __name__ == "__main__":

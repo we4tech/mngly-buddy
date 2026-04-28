@@ -27,9 +27,7 @@ def test_load_system_prompt_fallback_when_no_url(monkeypatch, tmp_path) -> None:
     assert prompt == "Fallback prompt"
 
 
-def test_create_search_and_read_note(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_search_and_read_note(redis_store) -> None:
     create_result = create_note("Sprint Planning", "Discuss roadmap and blockers")
     assert "Saved note" in create_result
 
@@ -42,9 +40,7 @@ def test_create_search_and_read_note(monkeypatch, tmp_path) -> None:
     assert "Discuss roadmap and blockers" in read_result
 
 
-def test_list_notes(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_list_notes(redis_store) -> None:
     assert list_notes() == "No notes found."
 
     create_note("Alpha", "first note")
@@ -56,18 +52,14 @@ def test_list_notes(monkeypatch, tmp_path) -> None:
     assert "beta" in result
 
 
-def test_delete_note(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_delete_note(redis_store) -> None:
     create_note("To Delete", "some content")
     assert "Deleted note 'to-delete'." == delete_note("to-delete")
     assert read_note("to-delete") == "No note found with id 'to-delete'."
     assert delete_note("to-delete") == "No note found with id 'to-delete'."
 
 
-def test_read_note_missing(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_read_note_missing(redis_store) -> None:
     result = read_note("does-not-exist")
     assert "No note found with id 'does-not-exist'." == result
 
@@ -90,9 +82,7 @@ def test_all_tools_contains_new_tools() -> None:
     assert "search_local_calendar" not in names
 
 
-def test_create_and_search_calendar_event(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_and_search_calendar_event(redis_store) -> None:
     result = create_calendar_event(
         title="Team standup",
         start_at="2026-04-20T09:00:00",
@@ -105,9 +95,7 @@ def test_create_and_search_calendar_event(monkeypatch, tmp_path) -> None:
     assert "team-standup" in found
 
 
-def test_create_recurring_event_specific_days(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_recurring_event_specific_days(redis_store) -> None:
     result = create_calendar_event(
         title="Morning run",
         start_at="2026-04-21T07:00:00",
@@ -121,9 +109,7 @@ def test_create_recurring_event_specific_days(monkeypatch, tmp_path) -> None:
     assert "[specific_days]" in found
 
 
-def test_create_event_invalid_recurrence(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_event_invalid_recurrence(redis_store) -> None:
     result = create_calendar_event(
         title="Bad event",
         start_at="2026-04-20T10:00:00",
@@ -133,9 +119,7 @@ def test_create_event_invalid_recurrence(monkeypatch, tmp_path) -> None:
     assert "Invalid recurrence" in result
 
 
-def test_create_and_list_reminder(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_and_list_reminder(redis_store) -> None:
     assert list_reminders() == "No reminders found."
 
     result = create_reminder(
@@ -150,9 +134,7 @@ def test_create_and_list_reminder(monkeypatch, tmp_path) -> None:
     assert "buy-groceries" in listed
 
 
-def test_create_recurring_reminder(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_create_recurring_reminder(redis_store) -> None:
     result = create_reminder(
         title="Weekly review",
         start_at="2026-04-25T09:00:00",
@@ -165,9 +147,7 @@ def test_create_recurring_reminder(monkeypatch, tmp_path) -> None:
     assert "[weekly]" in listed
 
 
-def test_duplicate_calendar_event_rejected(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_duplicate_calendar_event_rejected(redis_store) -> None:
     create_calendar_event(
         title="Daily standup",
         start_at="2026-04-22T09:00:00",
@@ -181,9 +161,7 @@ def test_duplicate_calendar_event_rejected(monkeypatch, tmp_path) -> None:
     assert "Duplicate" in result
 
 
-def test_duplicate_reminder_rejected(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_duplicate_reminder_rejected(redis_store) -> None:
     create_reminder(
         title="Take medicine",
         start_at="2026-04-22T08:00:00",
@@ -197,9 +175,7 @@ def test_duplicate_reminder_rejected(monkeypatch, tmp_path) -> None:
     assert "Duplicate" in result
 
 
-def test_delete_calendar_event(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_delete_calendar_event(redis_store) -> None:
     create_calendar_event(
         title="Lunch break",
         start_at="2026-04-22T12:00:00",
@@ -209,9 +185,7 @@ def test_delete_calendar_event(monkeypatch, tmp_path) -> None:
     assert "No event found with id 'lunch-break'." == delete_calendar_event("lunch-break")
 
 
-def test_delete_reminder(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("BUDDY_DB", str(tmp_path / "buddy.db"))
-
+def test_delete_reminder(redis_store) -> None:
     create_reminder(
         title="Call dentist",
         start_at="2026-04-22T10:00:00",

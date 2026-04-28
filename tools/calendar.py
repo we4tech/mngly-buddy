@@ -1,4 +1,4 @@
-"""Calendar tools — DB-backed ActivityEvent and Reminder management with macOS sync."""
+"""Calendar tools — Redis-backed ActivityEvent and Reminder management with macOS sync."""
 
 import re
 import time
@@ -10,7 +10,7 @@ from typing import Annotated
 from agent_framework import tool
 from pydantic import Field
 
-from db import get_connection
+from repositories.calendar_repository import CalendarRepository, get_calendar_repository
 
 
 # ---------------------------------------------------------------------------
@@ -85,32 +85,6 @@ def _slugify(value: str) -> str:
     return slug.strip("-") or "event"
 
 
-def _unique_event_id(title: str) -> str:
-    base = _slugify(title)
-    with get_connection() as conn:
-        if conn.execute("SELECT 1 FROM activity_events WHERE id = ?", (base,)).fetchone() is None:
-            return base
-        index = 2
-        while True:
-            candidate = f"{base}-{index}"
-            if conn.execute("SELECT 1 FROM activity_events WHERE id = ?", (candidate,)).fetchone() is None:
-                return candidate
-            index += 1
-
-
-def _unique_reminder_id(title: str) -> str:
-    base = _slugify(title)
-    with get_connection() as conn:
-        if conn.execute("SELECT 1 FROM reminders WHERE id = ?", (base,)).fetchone() is None:
-            return base
-        index = 2
-        while True:
-            candidate = f"{base}-{index}"
-            if conn.execute("SELECT 1 FROM reminders WHERE id = ?", (candidate,)).fetchone() is None:
-                return candidate
-            index += 1
-
-
 def _validate_recurrence(recurrence: str, recurrence_days: str) -> str | None:
     """Return an error string or None if valid."""
     if recurrence not in _VALID_RECURRENCES:
@@ -134,7 +108,6 @@ _NS_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 def _dt_to_nsdate(dt: datetime):
     from Foundation import NSDate  # type: ignore[import]
-
     secs = (dt.astimezone(timezone.utc) - _NS_EPOCH).total_seconds()
     return NSDate.dateWithTimeIntervalSinceReferenceDate_(secs)
 
@@ -229,7 +202,7 @@ def create_calendar_event(
         Field(description="Required when recurrence is 'specific_days'. Comma-separated weekdays, e.g. MON,WED,FRI."),
     ] = "",
 ) -> str:
-    """Create a calendar event and store it in the local database."""
+    """Create a calendar event and store it in Redis."""
     title = title.strip()
     if not title:
         return "Event title cannot be empty."
@@ -243,33 +216,27 @@ def create_calendar_event(
     start_at = start_at.strip()
     end_at = end_at.strip()
 
-    with get_connection() as conn:
-        duplicate = conn.execute(
-            "SELECT id FROM activity_events WHERE title = ? AND start_at = ?",
-            (title, start_at),
-        ).fetchone()
-        if duplicate:
-            return (
-                f"Duplicate: an event titled '{title}' already exists at {start_at} "
-                f"(id: {duplicate['id']}). Use a different title or time."
-            )
+    repo = get_calendar_repository()
+    existing_id = repo.get_event_dedup(title, start_at)
+    if existing_id:
+        return (
+            f"Duplicate: an event titled '{title}' already exists at {start_at} "
+            f"(id: {existing_id}). Use a different title or time."
+        )
 
     now = datetime.now(timezone.utc).isoformat()
-    event_id = _unique_event_id(title)
+    event_id = repo.unique_event_id(title)
     days = ",".join(d.strip().upper() for d in recurrence_days.split(",") if d.strip())
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO activity_events
-                (id, title, start_at, end_at, location, notes, recurrence,
-                 recurrence_days, source, external_id, calendar_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'local', '', '', ?)
-            """,
-            (event_id, title, start_at, end_at,
-             location.strip(), notes.strip(), recurrence, days, now),
-        )
-        conn.commit()
+    data = {
+        "id": event_id, "title": title, "start_at": start_at, "end_at": end_at,
+        "location": location.strip(), "notes": notes.strip(),
+        "recurrence": recurrence, "recurrence_days": days,
+        "source": "local", "external_id": "", "calendar_name": "", "created_at": now,
+    }
+
+    repo.save_event(data)
+    repo.set_event_dedup(title, start_at, event_id)
 
     return f"Created event '{event_id}'."
 
@@ -293,44 +260,43 @@ def search_calendar(
         Field(description="Maximum events to return. Must be between 1 and 50."),
     ] = 10,
 ) -> str:
-    """Search calendar events stored in the local database."""
+    """Search calendar events stored in Redis."""
     max_results = max(1, min(max_results, 50))
-    keyword = f"%{query.strip().lower()}%"
+    keyword = query.strip().lower()
+    from_d = from_date.strip()
+    to_d = to_date.strip()
 
-    params: list = [keyword, keyword, keyword]
-    date_filter = ""
-    if from_date.strip():
-        date_filter += " AND start_at >= ?"
-        params.append(from_date.strip())
-    if to_date.strip():
-        date_filter += " AND start_at <= ?"
-        params.append(to_date.strip())
-    params.append(max_results)
+    repo = get_calendar_repository()
+    all_ids = repo.list_event_ids()
 
-    with get_connection() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, title, start_at, end_at, location, recurrence, calendar_name
-            FROM activity_events
-            WHERE (lower(title) LIKE ? OR lower(location) LIKE ? OR lower(notes) LIKE ?)
-            {date_filter}
-            ORDER BY start_at
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
+    matches = []
+    for eid in all_ids:
+        ev = repo.get_event(eid)
+        if not ev:
+            continue
+        if from_d and ev["start_at"] < from_d:
+            continue
+        if to_d and ev["start_at"] > to_d:
+            continue
+        if keyword and not (
+            keyword in ev["title"].lower()
+            or keyword in ev["location"].lower()
+            or keyword in ev["notes"].lower()
+        ):
+            continue
+        matches.append(ev)
+        if len(matches) >= max_results:
+            break
 
-    if not rows:
+    if not matches:
         return "No events found."
 
-    lines = [f"Found {len(rows)} event(s):"]
-    for row in rows:
-        recur = f" [{row['recurrence']}]" if row["recurrence"] != "none" else ""
-        cal = f" ({row['calendar_name']})" if row["calendar_name"] else ""
-        loc = f" | {row['location']}" if row["location"] else ""
-        lines.append(
-            f"- {row['id']}: {row['title']}{cal} | {row['start_at']} -> {row['end_at']}{loc}{recur}"
-        )
+    lines = [f"Found {len(matches)} event(s):"]
+    for ev in matches:
+        recur = f" [{ev['recurrence']}]" if ev["recurrence"] != "none" else ""
+        cal = f" ({ev['calendar_name']})" if ev["calendar_name"] else ""
+        loc = f" | {ev['location']}" if ev["location"] else ""
+        lines.append(f"- {ev['id']}: {ev['title']}{cal} | {ev['start_at']} -> {ev['end_at']}{loc}{recur}")
 
     return "\n".join(lines)
 
@@ -342,7 +308,7 @@ def sync_calendar(
         Field(description="How many days ahead to sync from now. Must be between 1 and 7."),
     ] = 5,
 ) -> str:
-    """Sync events from macOS Calendar for the next N days into the local database. Skips duplicates."""
+    """Sync events from macOS Calendar for the next N days into Redis. Skips duplicates."""
     days_ahead = max(1, min(days_ahead, 7))
     now = datetime.now(timezone.utc)
     end = now + timedelta(days=days_ahead)
@@ -358,47 +324,35 @@ def sync_calendar(
     added = 0
     skipped = 0
     db_now = now.isoformat()
+    repo = get_calendar_repository()
 
-    with get_connection() as conn:
-        for ev in system_events:
-            # Dedup by external_id (preferred) or by (title, start_at)
-            if ev["external_id"]:
-                exists = conn.execute(
-                    "SELECT 1 FROM activity_events WHERE external_id = ?",
-                    (ev["external_id"],),
-                ).fetchone()
-            else:
-                exists = conn.execute(
-                    "SELECT 1 FROM activity_events WHERE title = ? AND start_at = ?",
-                    (ev["title"], ev["start_at"]),
-                ).fetchone()
+    for ev in system_events:
+        # Dedup by external_id (preferred) or by (title, start_at)
+        if ev["external_id"]:
+            exists = repo.event_extid_exists(ev["external_id"])
+        else:
+            exists = repo.event_dedup_exists(ev["title"], ev["start_at"])
 
-            if exists:
-                skipped += 1
-                continue
+        if exists:
+            skipped += 1
+            continue
 
-            event_id = _unique_event_id(ev["title"])
-            conn.execute(
-                """
-                INSERT INTO activity_events
-                    (id, title, start_at, end_at, location, notes, recurrence,
-                     recurrence_days, source, external_id, calendar_name, created_at)
-                VALUES (?, ?, ?, ?, ?, '', 'none', '', 'system', ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    ev["title"],
-                    ev["start_at"],
-                    ev["end_at"],
-                    ev["location"],
-                    ev["external_id"],
-                    ev["calendar_name"],
-                    db_now,
-                ),
-            )
-            added += 1
+        event_id = repo.unique_event_id(ev["title"])
+        data = {
+            "id": event_id, "title": ev["title"],
+            "start_at": ev["start_at"], "end_at": ev["end_at"],
+            "location": ev["location"], "notes": "",
+            "recurrence": "none", "recurrence_days": "",
+            "source": "system", "external_id": ev["external_id"],
+            "calendar_name": ev["calendar_name"], "created_at": db_now,
+        }
 
-        conn.commit()
+        repo.save_event(data)
+        if ev["external_id"]:
+            repo.set_event_extid(ev["external_id"], event_id)
+        else:
+            repo.set_event_dedup(ev["title"], ev["start_at"], event_id)
+        added += 1
 
     return (
         f"Sync complete: {added} new event(s) added, {skipped} duplicate(s) skipped "
@@ -421,7 +375,7 @@ def create_reminder(
         Field(description="Required when recurrence is 'specific_days'. Comma-separated weekdays, e.g. MON,WED,FRI."),
     ] = "",
 ) -> str:
-    """Create a reminder and store it in the local database."""
+    """Create a reminder and store it in Redis."""
     title = title.strip()
     if not title:
         return "Reminder title cannot be empty."
@@ -435,32 +389,27 @@ def create_reminder(
     start_at = start_at.strip()
     end_at = end_at.strip()
 
-    with get_connection() as conn:
-        duplicate = conn.execute(
-            "SELECT id FROM reminders WHERE title = ? AND end_at = ?",
-            (title, end_at),
-        ).fetchone()
-        if duplicate:
-            return (
-                f"Duplicate: a reminder titled '{title}' already exists due at {end_at} "
-                f"(id: {duplicate['id']}). Use a different title or due time."
-            )
+    repo = get_calendar_repository()
+    existing_id = repo.get_reminder_dedup(title, end_at)
+    if existing_id:
+        return (
+            f"Duplicate: a reminder titled '{title}' already exists due at {end_at} "
+            f"(id: {existing_id}). Use a different title or due time."
+        )
 
     now = datetime.now(timezone.utc).isoformat()
-    reminder_id = _unique_reminder_id(title)
+    reminder_id = repo.unique_reminder_id(title)
     days = ",".join(d.strip().upper() for d in recurrence_days.split(",") if d.strip())
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO reminders
-                (id, title, start_at, end_at, notes, recurrence, recurrence_days, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (reminder_id, title, start_at, end_at,
-             notes.strip(), recurrence, days, now),
-        )
-        conn.commit()
+    data = {
+        "id": reminder_id, "title": title,
+        "start_at": start_at, "end_at": end_at,
+        "notes": notes.strip(), "recurrence": recurrence,
+        "recurrence_days": days, "created_at": now,
+    }
+
+    repo.save_reminder(data)
+    repo.set_reminder_dedup(title, end_at, reminder_id)
 
     return f"Created reminder '{reminder_id}'."
 
@@ -472,22 +421,22 @@ def list_reminders(
         Field(description="Maximum reminders to return. Must be between 1 and 50."),
     ] = 20,
 ) -> str:
-    """List all reminders stored in the local database, ordered by due date."""
+    """List all reminders stored in Redis, ordered by due date."""
     max_results = max(1, min(max_results, 50))
 
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, title, start_at, end_at, recurrence FROM reminders ORDER BY end_at LIMIT ?",
-            (max_results,),
-        ).fetchall()
+    repo = get_calendar_repository()
+    ids = repo.list_reminder_ids(0, max_results - 1)
 
-    if not rows:
+    if not ids:
         return "No reminders found."
 
-    lines = [f"Found {len(rows)} reminder(s):"]
-    for row in rows:
-        recur = f" [{row['recurrence']}]" if row["recurrence"] != "none" else ""
-        lines.append(f"- {row['id']}: {row['title']} | due {row['end_at']}{recur}")
+    lines = [f"Found {len(ids)} reminder(s):"]
+    for rid in ids:
+        rem = repo.get_reminder(rid)
+        if not rem:
+            continue
+        recur = f" [{rem['recurrence']}]" if rem["recurrence"] != "none" else ""
+        lines.append(f"- {rem['id']}: {rem['title']} | due {rem['end_at']}{recur}")
 
     return "\n".join(lines)
 
@@ -499,18 +448,12 @@ def delete_calendar_event(
         Field(description="Event id, typically from search_calendar results."),
     ]
 ) -> str:
-    """Delete a calendar event from the local database by id."""
+    """Delete a calendar event from Redis by id."""
     safe_id = _slugify(event_id)
-
-    with get_connection() as conn:
-        result = conn.execute(
-            "DELETE FROM activity_events WHERE id = ?", (safe_id,)
-        )
-        conn.commit()
-
-    if result.rowcount == 0:
+    repo = get_calendar_repository()
+    if not repo.event_exists(safe_id):
         return f"No event found with id '{safe_id}'."
-
+    repo.delete_event(safe_id)
     return f"Deleted event '{safe_id}'."
 
 
@@ -521,16 +464,10 @@ def delete_reminder(
         Field(description="Reminder id, typically from list_reminders results."),
     ]
 ) -> str:
-    """Delete a reminder from the local database by id."""
+    """Delete a reminder from Redis by id."""
     safe_id = _slugify(reminder_id)
-
-    with get_connection() as conn:
-        result = conn.execute(
-            "DELETE FROM reminders WHERE id = ?", (safe_id,)
-        )
-        conn.commit()
-
-    if result.rowcount == 0:
+    repo = get_calendar_repository()
+    if not repo.reminder_exists(safe_id):
         return f"No reminder found with id '{safe_id}'."
-
+    repo.delete_reminder(safe_id)
     return f"Deleted reminder '{safe_id}'."
