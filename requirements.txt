@@ -8,3 +8,5 @@ pyobjc-framework-EventKit>=10.0
 rich>=13.0.0
 redis>=5.0.0
 fakeredis>=2.0.0
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14

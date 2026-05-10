@@ -12,6 +12,8 @@ from tools.calendar import (
 from tools.date import get_current_system_time
 from tools.files import get_file_content
 from tools.notes import create_note, delete_note, list_notes, read_note, search_notes
+from tools.songs import list_songs, search_songs, store_song
+from tools.voice import delete_all_voices, delete_voice, list_available_voices, list_voices, play_voice, record_voice, speak
 
 
 def all_tools() -> list:
@@ -31,6 +33,16 @@ def all_tools() -> list:
         read_note,
         delete_note,
         get_file_content,
+        store_song,
+        list_songs,
+        search_songs,
+        record_voice,
+        list_voices,
+        play_voice,
+        speak,
+        list_available_voices,
+        delete_voice,
+        delete_all_voices,
     ]
 
 

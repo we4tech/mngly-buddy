@@ -2,8 +2,11 @@ import argparse
 import asyncio
 import inspect
 import os
+import random
+import re
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,9 +15,11 @@ from urllib.parse import urljoin
 import httpx
 from rich.console import Console
 from rich.markdown import Markdown
-from agent_framework import Agent, AgentSession, InMemoryHistoryProvider, MCPStdioTool
+from agent_framework import Agent, AgentSession, FunctionInvocationContext, FunctionMiddleware, MCPStdioTool
 from agent_framework.openai import OpenAIChatCompletionClient
 from dotenv import load_dotenv
+
+from data_access.redis_history import RedisHistoryProvider
 
 from tools import all_tool_functions
 from training.chatml_logger import save_interaction
@@ -24,13 +29,156 @@ MCP_SERVER_PATH = Path(__file__).parent / "mcp_server.py"
 DEFAULT_PROMPT_PATH = Path("prompts/system_prompt.md")
 
 _verbose = False
+_speak = False
+_mic = False
 _console: "Console | None" = None
+
+_WORKING_PHRASES = [
+    "Working on it, give me a few seconds.",
+    "Ooh, good one! Let me think.",
+    "On it! Back in a flash.",
+    "Great question! Give me just a moment.",
+    "Let me look that up for you!",
+    "Hmm, let me figure this out.",
+    "One moment, I am on the case!",
+    "You got it! Just a tiny bit.",
+    "Thinking really hard right now.",
+    "Hold on, I am checking for you!",
+    "Almost there, just a second.",
+    "Sure thing! Searching now.",
+    "Let me find the answer for you.",
+    "Okay okay, give me just a sec.",
+    "On my way to finding that out!",
+]
 
 
 def vlog(msg: str) -> None:
     """Print a dim verbose line when --verbose is active."""
     if _verbose and _console is not None:
         _console.print(f"[dim]  ▸ {msg}[/dim]")
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown syntax for cleaner TTS output."""
+    # Remove fenced code blocks
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    # Remove inline code
+    text = re.sub(r"`[^`]*`", "", text)
+    # Remove ATX headers
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Remove bold / italic markers
+    text = re.sub(r"\*{1,3}([^*]*)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}([^_]*)_{1,3}", r"\1", text)
+    # Remove markdown links, keep link text
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def speak_text(text: str) -> None:
+    """Speak *text* aloud using the macOS 'say' command with the Junior (kid) voice.
+
+    Speech stops immediately if Enter is pressed while speaking.
+    """
+    import threading
+
+    clean = _strip_markdown(text)
+    if not clean:
+        return
+
+    proc = subprocess.Popen(
+        ["say", clean],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def _enter_watcher() -> None:
+        try:
+            sys.stdin.readline()
+        except (EOFError, OSError):
+            pass
+        proc.terminate()
+
+    watcher = threading.Thread(target=_enter_watcher, daemon=True)
+    watcher.start()
+    proc.wait()
+
+
+def speak_async(text: str) -> "subprocess.Popen[bytes]":
+    """Start speaking *text* in the background; returns the Popen handle.
+
+    Call ``proc.terminate()`` on the returned handle to stop playback early.
+    """
+    clean = _strip_markdown(text)
+    if not clean:
+        return subprocess.Popen(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(
+        ["say", clean],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def listen_voice_input() -> str | None:
+    """Record a spoken phrase and return its transcription, or None on failure.
+
+    Recording stops automatically after 2 seconds of silence, when the
+    phrase_time_limit (60 s) is reached, or immediately when Enter is pressed.
+    """
+    import threading
+    import speech_recognition as sr  # lazy import — only needed when --mic is active
+
+    recognizer = sr.Recognizer()
+    recognizer.pause_threshold = 2.0      # stop after 2 s of silence
+    recognizer.non_speaking_duration = 1.0
+
+    microphone = sr.Microphone()
+
+    # Calibrate for ambient noise before opening the background listener
+    with microphone as source:
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+
+    captured: list[sr.AudioData] = []
+    done_event = threading.Event()
+
+    def _on_phrase(_recognizer: sr.Recognizer, audio: sr.AudioData) -> None:
+        """Called by listen_in_background when a complete phrase is detected."""
+        captured.append(audio)
+        done_event.set()
+
+    # Start background listener — stops on silence (pause_threshold) or phrase_time_limit
+    stop_fn = recognizer.listen_in_background(microphone, _on_phrase, phrase_time_limit=60)
+
+    print("You> [🎤 listening… speak, then pause — or press Enter to stop] ", end="", flush=True)
+
+    def _enter_watcher() -> None:
+        """Signal done_event as soon as Enter is pressed."""
+        try:
+            sys.stdin.readline()
+        except (EOFError, OSError):
+            pass
+        done_event.set()
+
+    threading.Thread(target=_enter_watcher, daemon=True).start()
+
+    done_event.wait()          # unblocked by speech-end OR Enter key
+    stop_fn(wait_for_stop=False)
+
+    if not captured:
+        print("(stopped before speech was captured)")
+        return None
+
+    try:
+        text = recognizer.recognize_google(captured[0])  # type: ignore[attr-defined]
+        print(text)
+        return text
+    except sr.UnknownValueError:
+        print("(could not understand audio)")
+        return None
+    except sr.RequestError as exc:
+        print(f"(speech recognition error: {exc})")
+        return None
 
 
 def load_local_env() -> None:
@@ -133,10 +281,17 @@ def create_mcp_tool() -> MCPStdioTool:
     )
 
 
-def create_agent(mcp_tool: MCPStdioTool) -> tuple[Agent, InMemoryHistoryProvider]:
+def create_agent(mcp_tool: MCPStdioTool) -> tuple[Agent, RedisHistoryProvider]:
     from db import get_redis_url
-    history = InMemoryHistoryProvider()
+
+    class ToolCallLogger(FunctionMiddleware):
+        async def process(self, context: FunctionInvocationContext, call_next) -> None:
+            print(f"  🔧 [{context.function.name}]", flush=True)
+            await call_next()
+
+    history = RedisHistoryProvider()
     vlog(f"Redis URL: {get_redis_url()}")
+    vlog("History: Redis-backed (buddy:history:<session_id>)")
     vlog("Tools: buddy-tools MCP server")
     agent = Agent(
         client=OpenAIChatCompletionClient(
@@ -146,7 +301,11 @@ def create_agent(mcp_tool: MCPStdioTool) -> tuple[Agent, InMemoryHistoryProvider
         name="BuddyAgent",
         instructions=load_system_prompt(),
         tools=mcp_tool,
-        context_providers=[history]
+        context_providers=[history],
+        default_options={
+            "allow_multiple_tool_calls": True
+        },
+        middleware=[ToolCallLogger()],
     )
     return agent, history
 
@@ -320,11 +479,20 @@ async def run_interactive_session(agent: Agent) -> None:
     console = Console()
     session = AgentSession()
     vlog(f"New session: {session.session_id}")
-    console.print("Interactive session started. Type /help for tool commands, or 'exit' to quit.")
+    if _mic:
+        console.print("Interactive session started (voice input). Say 'exit' or 'quit' to stop.")
+    else:
+        console.print("Interactive session started. Type /help for tool commands, or 'exit' to quit.")
 
     while True:
         try:
-            user_prompt = input("You> ").strip()
+            if _mic:
+                user_prompt_raw = listen_voice_input()
+                if user_prompt_raw is None:
+                    continue
+                user_prompt = user_prompt_raw.strip()
+            else:
+                user_prompt = input("You> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting interactive session.")
             break
@@ -340,6 +508,7 @@ async def run_interactive_session(agent: Agent) -> None:
             continue
 
         print("Buddy> Processing… (Ctrl+C to cancel)", flush=True)
+        working_proc = speak_async(random.choice(_WORKING_PHRASES)) if _speak else None
         loop = asyncio.get_running_loop()
         task = asyncio.create_task(run_agent(agent, user_prompt, session=session))
 
@@ -350,17 +519,23 @@ async def run_interactive_session(agent: Agent) -> None:
         try:
             answer = await task
         except asyncio.CancelledError:
+            if working_proc:
+                working_proc.terminate()
             console.print("\n[yellow]⚠  Request cancelled.[/yellow]")
             continue
         finally:
             loop.remove_signal_handler(signal.SIGINT)
+            if working_proc:
+                working_proc.terminate()
 
         console.print("Buddy> ", end="")
         console.print(Markdown(answer))
+        if _speak:
+            speak_text(answer)
 
 
 async def main() -> None:
-    global _verbose, _console
+    global _verbose, _speak, _mic, _console
     parser = argparse.ArgumentParser(description="Run a basic Microsoft Agent Framework agent.")
     parser.add_argument(
         "prompt",
@@ -380,10 +555,24 @@ async def main() -> None:
         action="store_true",
         help="Print verbose internal state (config, tool calls, timings).",
     )
+    parser.add_argument(
+        "-s",
+        "--speak",
+        action="store_true",
+        help="Speak agent responses aloud using the Junior (kid) voice via macOS 'say'.",
+    )
+    parser.add_argument(
+        "-m",
+        "--mic",
+        action="store_true",
+        help="Use microphone voice input instead of keyboard (interactive mode only).",
+    )
     args = parser.parse_args()
 
     _console = Console()
     _verbose = args.verbose
+    _speak = args.speak
+    _mic = args.mic
 
     vlog("Verbose mode enabled")
     load_local_env()
@@ -407,6 +596,8 @@ async def main() -> None:
         answer = await run_agent(agent, args.prompt)
         console = Console()
         console.print(Markdown(answer))
+        if _speak:
+            speak_text(answer)
 
 
 if __name__ == "__main__":
