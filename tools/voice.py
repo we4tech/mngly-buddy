@@ -224,7 +224,7 @@ def play_voice(
 
 
 # Default voice used when none is specified
-_DEFAULT_VOICE = "Junior"
+_DEFAULT_VOICE = ""
 
 
 @tool(approval_mode="never_require")

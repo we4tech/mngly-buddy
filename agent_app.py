@@ -16,11 +16,10 @@ import httpx
 from rich.console import Console
 from rich.markdown import Markdown
 from agent_framework import Agent, AgentSession, FunctionInvocationContext, FunctionMiddleware, MCPStdioTool
-from agent_framework.openai import OpenAIChatCompletionClient
 from dotenv import load_dotenv
 
 from data_access.redis_history import RedisHistoryProvider
-
+from deepseek_client import DeepSeekChatCompletionClient
 from tools import all_tool_functions
 from training.chatml_logger import save_interaction
 
@@ -219,10 +218,14 @@ def validate_api_config() -> bool:
 def check_api_reachable() -> bool:
     """Check if the API endpoint is reachable and responding. Return True if healthy."""
     api_url = os.getenv("OPENAI_BASE_URL", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
 
     try:
+        headers = {
+            "Authorization": f"Bearer {api_key}" if api_key else "",
+        }
         endpoint = urljoin(api_url.rstrip("/") + "/", "models")
-        response = httpx.get(endpoint, timeout=5.0)
+        response = httpx.get(endpoint, headers=headers, timeout=5.0)
 
         if response.status_code >= 400:
             print(
@@ -294,7 +297,7 @@ def create_agent(mcp_tool: MCPStdioTool) -> tuple[Agent, RedisHistoryProvider]:
     vlog("History: Redis-backed (buddy:history:<session_id>)")
     vlog("Tools: buddy-tools MCP server")
     agent = Agent(
-        client=OpenAIChatCompletionClient(
+        client=DeepSeekChatCompletionClient(
             model=os.environ["OPENAI_MODEL"],
             api_key=os.environ["OPENAI_API_KEY"],
         ),
